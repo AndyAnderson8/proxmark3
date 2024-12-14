@@ -1468,6 +1468,131 @@ static int CmdHF_ntag424_changekey(const char *Cmd) {
     return res;
 }
 
+static int CmdHF_ntag424_raw(const char *Cmd) {
+    CLIParserContext *ctx;
+    CLIParserInit(&ctx, "hf ntag424 raw",
+                  "Send a raw APDU command to the NTAG424 with customizable parameters.",
+                  "hf ntag424 raw <raw bytes> -m <plain|mac|encrypt> [-s <session>] [-e <expected>]");
+
+    void *argtable[] = {
+        arg_param_begin,
+        arg_strx1(NULL, NULL, "<hex>", "Raw bytes to send"),
+        arg_str1("m", "mode", "<plain|mac|encrypt>", "Communication mode"),
+        arg_str0("s", "session", "<hex>", "Session key (HEX 32 bytes for encryption/MAC)"),
+        arg_str0("e", "expect", "<hex>", "Expected SW1 and SW2 (HEX 2 bytes, default: 91 00)"),
+        arg_param_end
+    };
+    CLIExecWithReturn(ctx, Cmd, argtable, false);
+
+    // Parse raw APDU bytes
+    uint8_t raw_bytes[256] = {0};
+    int raw_bytes_len = 0;
+    CLIGetHexWithReturn(ctx, 1, raw_bytes, &raw_bytes_len);
+
+    if (raw_bytes_len < 4) {
+        CLIParserFree(ctx);
+        PrintAndLogEx(ERR, "Raw bytes must be at least 4 bytes (CLA, INS, P1, P2)");
+        return PM3_EINVARG;
+    }
+
+    // Build the APDU structure from raw bytes
+    APDU_t apdu = {
+        .cla = raw_bytes[0],
+        .ins = raw_bytes[1],
+        .p1 = raw_bytes[2],
+        .p2 = raw_bytes[3],
+        .lc = (raw_bytes_len > 4) ? raw_bytes_len - 4 : 0,
+        .data = (raw_bytes_len > 4) ? &raw_bytes[4] : NULL,
+        .extended_apdu = false,
+    };
+
+    // Parse communication mode
+    ntag424_communication_mode_t comm_mode;
+    const CLIParserOption comm_mode_options[] = {
+        {COMM_PLAIN, "plain"},
+        {COMM_MAC,   "mac"},
+        {COMM_FULL,  "encrypt"},
+        {0,          NULL}
+    };
+    int comm_out = 0;
+    if (CLIGetOptionList(arg_get_str(ctx, 2), comm_mode_options, &comm_out)) {
+        CLIParserFree(ctx);
+        PrintAndLogEx(ERR, "Invalid communication mode");
+        return PM3_EINVARG;
+    }
+    comm_mode = (ntag424_communication_mode_t)comm_out;
+
+    // Parse expected SW1 and SW2
+    uint8_t expected[2] = {0x91, 0x00};  // Default expected SW1 and SW2
+    if (arg_get_str(ctx, 4)->count == 1) {
+        CLIGetHexWithReturn(ctx, 4, expected, NULL);
+        if (strlen(arg_get_str(ctx, 4)->sval[0]) != 4) {
+            CLIParserFree(ctx);
+            PrintAndLogEx(ERR, "Expected response must be exactly 2 bytes (e.g., 91 00)");
+            return PM3_EINVARG;
+        }
+    }
+
+    // Parse session keys (if provided)
+    ntag424_session_keys_t session_keys = {0};
+    bool has_session_keys = false;
+    if (arg_get_str(ctx, 3)->count == 1) {
+        has_session_keys = true;
+        uint8_t session_key_input[32] = {0};
+        int session_key_len = 0;
+        CLIGetHexWithReturn(ctx, 3, session_key_input, &session_key_len);
+
+        // Ensure the session key length matches the expected size
+        if (session_key_len != sizeof(session_keys.encryption) + sizeof(session_keys.mac)) {
+            CLIParserFree(ctx);
+            PrintAndLogEx(ERR, "Session key must be %lu bytes", sizeof(session_keys.encryption) + sizeof(session_keys.mac));
+            return PM3_EINVARG;
+        }
+
+        // Split session_key_input into session_keys.encryption and session_keys.mac
+        memcpy(session_keys.encryption, session_key_input, sizeof(session_keys.encryption));
+        memcpy(session_keys.mac, session_key_input + sizeof(session_keys.encryption), sizeof(session_keys.mac));
+    }
+
+    CLIParserFree(ctx);
+
+    // Ensure a card is selected
+    if (SelectCard14443A_4(false, true, NULL) != PM3_SUCCESS) {
+        PrintAndLogEx(ERR, "Failed to select card");
+        DropField();
+        return PM3_ERFTRANS;
+    }
+
+    // Perform the APDU exchange
+    uint8_t response[256] = {0};
+    int response_len = sizeof(response);
+
+    int res = ntag424_exchange_apdu(
+        apdu,
+        0,  // Command header length (set to 0, as header length isn't separately handled here)
+        response,
+        &response_len,
+        comm_mode,
+        has_session_keys ? &session_keys : NULL,
+        expected[0],
+        expected[1]
+    );
+
+    DropField();
+
+    // Handle results
+    if (res != PM3_SUCCESS) {
+        PrintAndLogEx(ERR, "Failed to exchange APDU (error %d)", res);
+        return res;
+    }
+
+    // Print response
+    PrintAndLogEx(SUCCESS, "APDU response: ");
+    print_hex_break(response, response_len, 16);
+    return PM3_SUCCESS;
+}
+
+
 static command_t CommandTable[] = {
     {"help",         CmdHelp,                          AlwaysAvailable,  "This help"},
     {"-----------",  CmdHelp,                          IfPm3Iso14443a,   "----------------------- " _CYAN_("operations") " -----------------------"},
@@ -1479,6 +1604,7 @@ static command_t CommandTable[] = {
     {"getfs",        CmdHF_ntag424_getfilesettings,    IfPm3Iso14443a,   "Get file settings"},
     {"changefs",     CmdHF_ntag424_changefilesettings, IfPm3Iso14443a,   "Change file settings"},
     {"changekey",    CmdHF_ntag424_changekey,          IfPm3Iso14443a,   "Change key"},
+    {"raw",          CmdHF_ntag424_raw,                IfPm3Iso14443a,   "Send a raw APDU command to NTAG424"},
     {NULL, NULL, NULL, NULL}
 };
 
